@@ -1,6 +1,7 @@
 import PyPDF2
 import os
 import csv  # Importa el módulo para manejar CSV
+import re
 
 def read_pdf(file_path):
     print("Reading PDF file...")  # Verifica si se llama a esta función
@@ -18,34 +19,61 @@ def read_pdf(file_path):
         print(f"Error reading PDF: {e}")
         return None
 
+
 def extract_scores(text):
-    print("Extracting scores...")  # Verifica si se llama a esta función
-    if not text.strip():
-        print("No text found in the PDF.")  # Mensaje si el PDF está vacío
-        return []
-    
-    # Procesa el texto para extraer datos
+    """
+    Busca solo las líneas con formato:
+    APELLIDO1 APELLIDO2, NOMBRE ***DNI** PUNTUACIÓN
+    y devuelve una lista de tuplas:
+    (apellido1, apellido2, nombre, dni_ofuscado, puntuacion_float)
+    """
+    print("Extracting scores...")
+    # Patrón sin comillas
+    pattern = re.compile(
+        r'(?P<apellido1>[^ ,*]+)\s+'        # primer apellido
+        r'(?P<apellido2>[^,]+),\s*'         # segundo apellido + coma
+        r'(?P<nombre>[^*]+?)\s+'            # nombre (hasta los asteriscos)
+        r'\*{3}(?P<dni>\d+)\*{2}\s+'        # ***DNI**
+        r'(?P<score>\d{1,2},\d{2})'         # puntuación
+    , re.UNICODE)
+
     scores = []
-    lines = text.splitlines()
-    print("Lines extracted from PDF:")  # Imprime las líneas extraídas
-    for line in lines:
-        print(f"Line: {line}")  # Imprime cada línea para depuración
-        parts = line.split()
-        if len(parts) >= 3:  # Asegúrate de que haya al menos 3 columnas (nombre, DNI, puntuación)
-            try:
-                name = " ".join(parts[:-2])  # Nombre y apellidos
-                dni = parts[-2]  # DNI
-                score = float(parts[-1])  # Puntuación
-                scores.append((name, dni, score))
-            except ValueError:
-                print(f"Skipping line due to invalid score: {line}")  # Mensaje si la puntuación no es válida
-                print(f"Parts: {parts}")  # Imprime las partes de la línea para depuración
-                continue  # Ignora líneas donde la puntuación no sea un número
-    
-    # Ordena las puntuaciones en orden descendente
-    scores.sort(key=lambda x: x[2], reverse=True)
-    print(f"Extracted and sorted {len(scores)} scores.")  # Confirma cuántos registros se extrajeron y ordenaron
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        # Quita comillas al inicio/fin para que casen las líneas sin ellas
+        line_clean = raw.strip('"')
+        print(f"→ intentando con: {line_clean}")
+        m = pattern.match(line_clean)
+        if not m:
+            continue
+        print(f"✓ match: {line_clean}")
+        a1 = m.group('apellido1')
+        a2 = m.group('apellido2')
+        nombre = m.group('nombre').strip()
+        dni_ofus = f'***{m.group("dni")}**'
+        score = float(m.group('score').replace(',', '.'))
+        scores.append((a1, a2, nombre, dni_ofus, score))
+
+    scores.sort(key=lambda x: x[4], reverse=True)
+    print(f"Extraídos {len(scores)} registros válidos.")
     return scores
+
+def export_scores_to_csv(scores, output_file):
+    """
+    Escribe un CSV con:
+    Apellido1,Apellido2,Nombre,DNI_ofuscado,Puntuación
+    sin comillas en la puntuación (usar coma decimal).
+    """
+    with open(output_file, 'w', encoding='utf-8') as f:
+        # Cabecera
+        f.write("Apellido1;Apellido2;Nombre;DNI_ofuscado;Puntuación\n")
+        for a1, a2, nombre, dni, score in scores:
+            # formateamos la puntuación con coma decimal
+            score_str = f"{score:.2f}".replace('.', ',')
+            # unimos manualmente con comas, sin quoting
+            f.write(f"{a1};{a2};{nombre};{dni};{score_str}\n")
 
 def export_to_csv(scores_table, output_file):
     print(f"Exporting data to {output_file}...")  # Mensaje de inicio de exportación
@@ -73,10 +101,11 @@ def export_text_to_csv(text, output_file):
     except Exception as e:
         print(f"Error exporting text to CSV: {e}")
 
-if name == "main":
-    pdf_path = input("Enter the path to the PDF file: ")
+if __name__ == "__main__":
+    pdf_path = input("Ruta al PDF: ")
     pdf_text = read_pdf(pdf_path)
     if pdf_text:
-        print("Exporting extracted text to CSV...")
-        output_csv = os.path.join(os.path.dirname(file), "extracted_text.csv")
-        export_text_to_csv(pdf_text, output_csv)
+        scores = extract_scores(pdf_text)
+        output_csv = os.path.join(os.path.dirname(pdf_path), "scores_filtrados.csv")
+        export_scores_to_csv(scores, output_csv)
+        print(f"CSV generado en {output_csv} con {len(scores)} registros.")
