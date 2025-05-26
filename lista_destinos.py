@@ -1,8 +1,9 @@
-from camelot.io import read_pdf
+import tabula
 import pdfplumber
 import pandas as pd
+import re
 
-PDF_PATH = 'listado0.pdf'
+PDF_PATH = 'listado.pdf'
 CSV_OUT = 'vacantes.csv'
 
 PREFIXES = (
@@ -11,87 +12,144 @@ PREFIXES = (
     'BIBLIOTECA', 'CENTRO', 'ENTIDAD', 'GERENCIA', 'MUSEO',
     'OFICINA', 'S.GRAL', 'COMISION', 'MANCOMUNIDAD'
 )
+PUESTO_PREFIXES = ('AUXILIAR', 'GESTOR', 'SECRETARIO', 'JEFE', 'TECNICO')
 
 
 def extract_ministerios(pdf_path):
-    print("Extraer tablas")
-    ministerios = {}
+    """
+    Extrae la línea de ministerio/organismo antes de cada tabla.
+    Devuelve una lista de cadenas, una por cada tabla en el PDF.
+    """
+    ministerios = []
     with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            for line in page.extract_text().split('\n'):
-                if any(line.startswith(pref) for pref in PREFIXES):
-                    ministerios[str(i)] = line.strip()
+        for page in pdf.pages:
+            lines = [l.strip() for l in (page.extract_text() or '').split('\n') if l.strip()]
+            for idx, line in enumerate(lines):
+                if any(line.startswith(pref + ' ') or line == pref for pref in PREFIXES):
+                    if idx + 1 < len(lines) and lines[idx + 1].startswith('PUESTO'):
+                        ministerios.append(line)
+    return ministerios
+
+
+def leer_tablas(pdf_path, num_pages):
+    """
+    Lee tablas por página, intentando primero lattice y luego stream.
+    Devuelve una lista de listas de DataFrames, uno por página.
+    """
+    tables_by_page = []
+    for p in range(1, num_pages + 1):
+        try:
+            dfs = tabula.read_pdf(pdf_path, pages=p, multiple_tables=True, lattice=True)
+        except:
+            dfs = []
+        if not dfs:
+            dfs = tabula.read_pdf(pdf_path, pages=p, multiple_tables=True, stream=True)
+        tables_by_page.append(dfs)
+    return tables_by_page
+
+
+def normalize_lines(raw):
+    """
+    Divide el texto raw en líneas y separa fusiones de puesto pegadas.
+    """
+    parts = [l.strip() for l in re.split(r'[\r\n]+', raw) if l.strip()]
+    # Tras dividir en líneas y hacer strip():
+    clean = [l for l in parts if not re.fullmatch(r'\d{1,2}', l)]
+    output = []
+    for l in parts:
+        split_done = False
+        for pref in PUESTO_PREFIXES:
+            idx = l.find(pref)
+            if idx > 0 and not l.startswith(pref):
+                output.append(l[:idx].strip())
+                output.append(l[idx:].strip())
+                split_done = True
+                break
+        if not split_done:
+            output.append(l)
+    return output
+
+
+def parse_table(df, ministerio):
+    """
+    Procesa un DataFrame de una página combinada y extrae registros.
+    """
+    records = []
+    for _, row in df.iterrows():
+        raw = "\n".join(str(row[c]) for c in df.columns if pd.notnull(row[c]))
+        # Saltar encabezado
+        if 'PUESTO' in raw and 'NÚMERO' in raw:
+            continue
+        # Salario
+        m_sal = re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}", raw)
+        sal = m_sal.group(0) if m_sal else ''
+        # Normalizar
+        lines = normalize_lines(raw)
+        # Limpiar
+        clean = [l for l in lines if not l.isdigit() and l != sal]
+        # Campos fijos
+        cdir = clean[0] if len(clean) > 0 else ''
+        cdes = clean[1] if len(clean) > 1 else ''
+        provincia = clean[2] if len(clean) > 2 else ''
+        localidad = ''
+        cp = ''
+        # Detectar localidad+cp fusionados
+        for l in clean[3:]:
+            m = re.match(r"^(.+?)(\d{6,})$", l)
+            if m:
+                localidad = m.group(1).strip()
+                cp = m.group(2)
+                break
+        # Fallback cp: primer número puro >=6 dígitos
+        if not cp:
+            for l in lines:
+                cp = next((l for l in clean if re.fullmatch(r'\d{6,}', l)), '')
+        # Fallback localidad: primera clean con coma
+        if not localidad:
+            for l in clean[3:]:
+                if ',' in l:
+                    localidad = re.sub(r"\d+$", "", l).strip()
                     break
-    return ministerios, len(pdf.pages)
+        # Fallback localidad alt: elemento 3 de clean
+        if not localidad and len(clean) > 3:
+            localidad = clean[3]
+        # Puesto
+        puesto = ''
+        for l in clean[2:]:
+            if any(l.startswith(pref) for pref in PUESTO_PREFIXES):
+                puesto = l
+                break
+        records.append({
+            'MINISTERIO': ministerio,
+            'CDIR':       cdir,
+            'CDES':       cdes,
+            'PROVINCIA':  provincia,
+            'LOCALIDAD':  localidad,
+            'PUESTO':     puesto,
+            'CPUESTO':    cp,
+            'ESPECIFICO': sal
+        })
+    return records
 
-
-def parse_tables(tables, ministerios, page):
-    """
-    Intento de parseo de las tablas extraídas.
-    Retorna lista de dicts (registros) o [] si no puede encontrar columnas esperadas.
-    """
-    registros = []
-    for table in tables:
-        df = table.df
-        # primer fila = header real
-        header = df.iloc[0].tolist()
-        df = df[1:].copy()
-        df.columns = header
-
-        cols = df.columns.tolist()
-        cd_col     = next((c for c in cols if 'CENTRO DIRECTIVO' in c), None)
-        prov_col   = next((c for c in cols if 'PROVINCIA' in c),       None)
-        puesto_col = next((c for c in cols if 'PUESTO DE TRABAJO' in c),None)
-        espec_col  = next((c for c in cols if 'ESPECÍFICO' in c),      None)
-
-        if not all([cd_col, prov_col, puesto_col, espec_col]):
-            return []
-
-        for _, row in df.iterrows():
-            # descomponemos cada campo multi-línea
-            cd_parts     = row[cd_col].split('\n')
-            prov_parts   = row[prov_col].split('\n')
-            puesto_parts = row[puesto_col].split('\n')
-            espec_parts  = row[espec_col].split('\n')
-
-            registros.append({
-                'MINISTERIO': ministerios.get(str(page), ''),
-                'CDIR':       cd_parts[0].strip()   if len(cd_parts) > 0 else '',
-                'CDES':       cd_parts[1].strip()   if len(cd_parts) > 1 else '',
-                'PROVINCIA':  prov_parts[0].strip() if len(prov_parts) > 0 else '',
-                'LOCALIDAD':  prov_parts[1].strip() if len(prov_parts) > 1 else '',
-                'PUESTO':     puesto_parts[0].strip() if len(puesto_parts) > 0 else '',
-                'CPUESTO':    puesto_parts[1].strip() if len(puesto_parts) > 1 else '',
-                'ESPECIFICO': espec_parts[1].strip() if len(espec_parts) > 1 else '',
-            })
-    return registros
-
-def main():
-    ministerios, total_pages = extract_ministerios(PDF_PATH)
-    all_records = []
-
-    for page in range(1, total_pages + 1):
-        # Primer intento con lattice
-        tables   = read_pdf(PDF_PATH, pages=str(page), flavor='lattice')
-        registros = parse_tables(tables, ministerios, page)
-
-        # Si falla, reintenta con stream
-        if not registros:
-            tables   = read_pdf(PDF_PATH, pages=str(page), flavor='stream')
-            registros = parse_tables(tables, ministerios, page)
-
-        all_records.extend(registros)
-
-    df_out = pd.DataFrame(
-        all_records,
-        columns=[
-            'MINISTERIO','CDIR','CDES',
-            'PROVINCIA','LOCALIDAD',
-            'PUESTO','CPUESTO','ESPECIFICO'
-        ]
-    )
-    df_out.to_csv(CSV_OUT, sep=";", index=False, encoding='utf-8-sig')
-    print(f"Se ha generado '{CSV_OUT}' con {len(df_out)} registros.")
 
 if __name__ == '__main__':
-    main()
+    ministerios = extract_ministerios(PDF_PATH)
+    with pdfplumber.open(PDF_PATH) as pdf:
+        num_pages = len(pdf.pages)
+    tables_by_page = leer_tablas(PDF_PATH, num_pages)
+    all_records = []
+    for idx, ministerio in enumerate(ministerios):
+        if idx < len(tables_by_page):
+            dfs = tables_by_page[idx]
+            if not dfs:
+                continue
+            # Concatenar todas las tablas de la página
+            df_all = pd.concat(dfs, ignore_index=True)
+            recs = parse_table(df_all, ministerio)
+            all_records.extend(recs)
+    df_out = pd.DataFrame(
+        all_records,
+        columns=['MINISTERIO', 'CDIR', 'CDES', 'PROVINCIA', 'LOCALIDAD', 'PUESTO', 'CPUESTO', 'ESPECIFICO']
+    )
+    df_out.to_csv(CSV_OUT, sep=';', index=False, encoding='utf-8-sig')
+    print(f"Se ha generado '{CSV_OUT}' con {len(df_out)} registros.")
